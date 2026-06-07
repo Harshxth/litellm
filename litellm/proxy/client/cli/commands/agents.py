@@ -145,21 +145,58 @@ def _exec(path: str, args: Sequence[str], env: Mapping[str, str]) -> None:
     os.execvpe(path, list(args), dict(env))
 
 
+STDIN_FILENO = 0
+
+
+def _restore_controlling_tty(
+    *,
+    isatty: Callable[[int], bool] = os.isatty,
+    open_tty: Callable[[], int] = lambda: os.open("/dev/tty", os.O_RDONLY),
+    dup2: Callable[[int, int], int] = os.dup2,
+    close: Callable[[int], None] = os.close,
+) -> None:
+    """Reconnect stdin to the controlling terminal when it has been detached.
+
+    Completing an in-line `login` before the hand-off can leave stdin no longer
+    pointing at the terminal, which makes a TUI client (Claude Code) fall back
+    to non-interactive `--print` mode and exit immediately. Reopening /dev/tty
+    onto stdin restores an interactive terminal so the agent launches normally.
+    A no-op when stdin is already a TTY or there is no controlling terminal.
+    """
+    if isatty(STDIN_FILENO):
+        return
+    try:
+        tty_fd = open_tty()
+    except OSError:
+        return
+    try:
+        dup2(tty_fd, STDIN_FILENO)
+    finally:
+        if tty_fd > STDIN_FILENO:
+            close(tty_fd)
+
+
 def run_agent(
     base_url: str,
     api_key: str,
     command: Sequence[str],
     *,
     skip_verify: bool = False,
+    restore_tty: bool = False,
     base_env: Optional[Mapping[str, str]] = None,
     which: Callable[[str], Optional[str]] = shutil.which,
     verify: Callable[[str, str], None] = verify_proxy_key,
+    restore_controlling_tty: Callable[[], None] = _restore_controlling_tty,
     launcher: Callable[[str, Sequence[str], Mapping[str, str]], None] = _exec,
 ) -> None:
     """Validate, wire the environment, and hand off to the agent.
 
     On success this replaces the current process and never returns. Raises
     AgentRunError for missing binaries, an unreachable proxy, or a rejected key.
+
+    When restore_tty is set, stdin is reconnected to the controlling terminal
+    just before hand-off, so an agent launched right after an in-line login
+    still starts interactively instead of in `--print` mode.
     """
     if not command:
         raise AgentRunError("Nothing to run.")
@@ -181,6 +218,8 @@ def run_agent(
         profiles,
     )
     extra_args = agent_launch_args(command[0], base_url)
+    if restore_tty:
+        restore_controlling_tty()
     launcher(binary, [command[0], *extra_args, *command[1:]], env)
 
 
@@ -217,6 +256,7 @@ def _launch(
     ctx: click.Context, binary: str, args: Sequence[str], *, skip_verify: bool
 ) -> None:
     base_url = ctx.obj["base_url"]
+    stdin_was_tty = _is_interactive()
     api_key = _resolve_api_key(ctx)
 
     display_name, _ = agent_profile(binary)
@@ -225,7 +265,13 @@ def _launch(
     )
 
     try:
-        run_agent(base_url, api_key, [binary, *args], skip_verify=skip_verify)
+        run_agent(
+            base_url,
+            api_key,
+            [binary, *args],
+            skip_verify=skip_verify,
+            restore_tty=stdin_was_tty,
+        )
     except AgentRunError as e:
         raise click.ClickException(str(e))
 

@@ -14,6 +14,7 @@ sys.path.insert(
 
 from litellm.proxy.client.cli.commands.agents import (
     AgentRunError,
+    _restore_controlling_tty,
     agent_commands,
     agent_launch_args,
     agent_profile,
@@ -286,6 +287,96 @@ class TestRunAgent:
         with pytest.raises(AgentRunError):
             run_agent("http://localhost:4000", "sk-key", [])
 
+    def test_restore_tty_runs_before_launch(self):
+        events = []
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude"],
+            restore_tty=True,
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify=lambda *a: None,
+            restore_controlling_tty=lambda: events.append("restore"),
+            launcher=lambda *a: events.append("launch"),
+        )
+        assert events == ["restore", "launch"]
+
+    def test_restore_tty_not_called_by_default(self):
+        events = []
+        run_agent(
+            "http://localhost:4000",
+            "sk-key",
+            ["claude"],
+            base_env={},
+            which=lambda name: "/usr/local/bin/claude",
+            verify=lambda *a: None,
+            restore_controlling_tty=lambda: events.append("restore"),
+            launcher=lambda *a: events.append("launch"),
+        )
+        assert events == ["launch"]
+
+    def test_restore_tty_skipped_when_verify_fails(self):
+        events = []
+
+        def boom(*a):
+            raise AgentRunError("rejected")
+
+        with pytest.raises(AgentRunError):
+            run_agent(
+                "http://localhost:4000",
+                "sk-key",
+                ["claude"],
+                restore_tty=True,
+                base_env={},
+                which=lambda name: "/usr/local/bin/claude",
+                verify=boom,
+                restore_controlling_tty=lambda: events.append("restore"),
+                launcher=lambda *a: events.append("launch"),
+            )
+        assert events == []
+
+
+class TestRestoreControllingTty:
+    def test_reopens_dev_tty_onto_stdin_when_detached(self):
+        calls = {}
+
+        _restore_controlling_tty(
+            isatty=lambda fd: False,
+            open_tty=lambda: 7,
+            dup2=lambda src, dst: calls.update(dup2=(src, dst)),
+            close=lambda fd: calls.update(closed=fd),
+        )
+
+        assert calls["dup2"] == (7, 0)
+        assert calls["closed"] == 7
+
+    def test_noop_when_stdin_already_a_tty(self):
+        def fail(*a, **k):
+            raise AssertionError("must not touch the terminal when stdin is a tty")
+
+        _restore_controlling_tty(
+            isatty=lambda fd: True,
+            open_tty=fail,
+            dup2=fail,
+            close=fail,
+        )
+
+    def test_gracefully_handles_no_controlling_terminal(self):
+        dup2_calls = []
+
+        def no_tty():
+            raise OSError("no /dev/tty")
+
+        _restore_controlling_tty(
+            isatty=lambda fd: False,
+            open_tty=no_tty,
+            dup2=lambda src, dst: dup2_calls.append((src, dst)),
+            close=lambda fd: None,
+        )
+
+        assert dup2_calls == []
+
 
 class TestAgentCommands:
     def setup_method(self):
@@ -395,6 +486,40 @@ class TestAgentCommands:
         assert result.exit_code == 0, result.output
         assert captured["api_key"] == "sk-after-login"
         mock_get.assert_called_once_with(expected_base_url="http://localhost:4000")
+
+    def test_interactive_launch_requests_tty_restore(self):
+        captured = {}
+        with (
+            patch(f"{AGENTS_MODULE}._is_interactive", return_value=True),
+            patch(
+                f"{AGENTS_MODULE}.run_agent",
+                side_effect=lambda b, k, c, **kw: captured.update(kw),
+            ),
+        ):
+            result = self.runner.invoke(
+                _agent_command("claude"),
+                [],
+                obj={"base_url": "http://localhost:4000", "api_key": "sk-key"},
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["restore_tty"] is True
+
+    def test_piped_launch_does_not_restore_tty(self):
+        captured = {}
+        with (
+            patch(f"{AGENTS_MODULE}._is_interactive", return_value=False),
+            patch(
+                f"{AGENTS_MODULE}.run_agent",
+                side_effect=lambda b, k, c, **kw: captured.update(kw),
+            ),
+        ):
+            result = self.runner.invoke(
+                _agent_command("claude"),
+                ["-p", "summarize"],
+                obj={"base_url": "http://localhost:4000", "api_key": "sk-key"},
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["restore_tty"] is False
 
     def test_agent_run_error_becomes_click_error(self):
         with patch(
